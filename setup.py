@@ -1,4 +1,13 @@
 from distutils.core import setup
+from codecs import open
+from os import path
+
+here = path.abspath(path.dirname(__file__))
+
+# Get the long description from the README file
+with open(path.join(here, 'README.rst'), encoding='utf-8') as f:
+    long_description = f.read()
+
 
 PACKAGE = "redistools"
 NAME = "redistools"
@@ -12,7 +21,7 @@ setup(
     name=NAME,
     version=VERSION,
     description=DESCRIPTION,
-    # long_description=read("README.md"),
+    long_description=long_description,
     author=AUTHOR,
     author_email=AUTHOR_EMAIL,
     license="GNU General Public License v3 (GPLv3)",
