@@ -23,7 +23,6 @@ except ImportError:
 
 from redis import Redis
 import redis_collections
-import redis_lock
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -58,21 +57,16 @@ class RedisDefaultDict(RedisTools, redis_collections.DefaultDict):
     pass
 
 
-AlreadyAcquired = redis_lock.AlreadyAcquired
-NotAcquired = redis_lock.NotAcquired
-AlreadyStarted = redis_lock.AlreadyStarted
-TimeoutNotUsable = redis_lock.TimeoutNotUsable
-InvalidTimeout = redis_lock.InvalidTimeout
-TimeoutTooLarge = redis_lock.TimeoutTooLarge
-NotExpirable = redis_lock.NotExpirable
+class InvalidTimeout(RuntimeError):
+    pass
 
 
 class InvalidOperator(RuntimeError):
     pass
 
 
-class RedisLock(RedisTools, redis_lock.Lock):
-    def __init__(self, redis=None, key=None, expire=None, auto_renewal=False):
+class RedisLock(RedisTools):
+    def __init__(self, redis=None, key=None, expire=None, care_operator=False):
         """
         :param redis:
             An instance of :class:`~StrictRedis`.
@@ -81,42 +75,79 @@ class RedisLock(RedisTools, redis_lock.Lock):
         :param expire:
             The lock expiry time in seconds. If left at the default (None)
             the lock will not expire.
-        :param auto_renewal:
-            If set to ``True``, Lock will automatically renew the lock so that it
-            doesn't expire for as long as the lock is held (acquire() called
-            or running in a context manager).
-
-            Implementation note: Renewal will happen using a daemon thread with
-            an interval of ``expire*2/3``. If wishing to use a different renewal
-            time, subclass Lock, call ``super().__init__()`` then set
-            ``self._lock_renewal_interval`` to your desired interval.
         """
         if not key:
             key = self._create_key()
         self.key = key
         redis = redis or Redis()
-        super(RedisLock, self).__init__(redis_client=redis, name=key, expire=expire, id=key.encode(),
-                                        auto_renewal=auto_renewal)
+        self._redis = redis
+        self._expire = expire if expire is None else int(expire)
+        self._name = key + ":_name"
+        self._signal = key + ":_signal"
         self._owner = None
-
-    @property
-    def _held(self):
-        return self._owner == _get_ident()
+        self.care_operator = care_operator
 
     def acquire(self, blocking=True, timeout=None):
-        if self._owner == _get_ident():
+        if self.care_operator and self._owner == _get_ident():
             raise InvalidOperator("Already acquired lock by this process and this thread")
-        result = super(RedisLock, self).acquire(blocking, timeout)
-        if result:
-            self._owner = _get_ident()
-        return result
+        timeout = timeout if timeout is None else int(timeout)
+        if timeout is not None and timeout <= 0:
+            raise InvalidTimeout("Timeout (%d) cannot be less than or equal to 0" % timeout)
+
+        if timeout and self._expire and timeout > self._expire:
+            raise InvalidTimeout("Timeout (%s) cannot be greater than expire (%d)" % (str(timeout), self._expire))
+
+        busy = True
+        blpop_timeout = timeout or self._expire or 0
+        timed_out = False
+        while busy:
+            busy = not self._redis.set(self._name, self.key, nx=True, ex=self._expire)
+            _logger.debug("busy=" + str(busy))
+            if busy:
+                if timed_out:
+                    return False
+                elif blocking:
+                    timed_out = not self._redis.blpop(self._signal, blpop_timeout) and timeout
+                    _logger.debug("timeout=" + str(timeout))
+                else:
+                    _logger.debug("Failed to get %r.", self._name)
+                    return False
+
+        _logger.debug("Got lock for %r.", self._name)
+        self._owner = _get_ident()
+        return True
+
+    def __enter__(self):
+        acquired = self.acquire(blocking=True)
+        assert acquired, "Lock wasn't acquired, but blocking=True"
+        return self
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        self.release()
 
     def release(self):
-        if self._owner == _get_ident():
-            super(RedisLock, self).release()
-            self._owner = None
+        if (not self.care_operator) or self._owner == _get_ident():
+            _logger.debug("Releasing %r.", self._name)
+            self.reset()
         else:
             raise InvalidOperator("cannot release lock by other thread or process")
+
+    def reset(self):
+        """
+        Forcibly deletes the lock. Use this with care.
+        """
+        pipe = self._redis.pipeline()
+        with pipe:
+            pipe.delete(self._signal)
+            pipe.lpush(self._signal, 1)
+            pipe.delete(self._name)
+            # pipe.delete(self._signal)
+            result = pipe.execute()
+            _logger.debug(result)
+        self._owner = None
+
+    def _delete_signal(self):
+        self._redis.delete(self._signal)
 
     def _release_save(self):
         self.release()  # No state to save
@@ -126,7 +157,7 @@ class RedisLock(RedisTools, redis_lock.Lock):
 
     def _is_owned(self):
         # Return True if lock is owned by current_thread.
-        return self._held
+        return self._owner == _get_ident()
 
     def locked(self):
         if self._is_owned():
@@ -155,12 +186,12 @@ class RedisRLock(RedisTools):
 
     """
 
-    def __init__(self, redis=None, key=None, expire=None, auto_renewal=False):
+    def __init__(self, redis=None, key=None, expire=None):
         if not key:
             key = self._create_key()
         self.key = key
         self._block_key = self.key + ":RedisLock:_block"
-        self._block = RedisLock(redis=redis, key=self._block_key, expire=expire, auto_renewal=auto_renewal)
+        self._block = RedisLock(redis=redis, key=self._block_key, expire=expire)
         self._owner = None
         self._count = 0
 
@@ -201,15 +232,15 @@ class RedisRLock(RedisTools):
         been acquired, false if the timeout has elapsed.
 
         """
-        try:
-            rc = self._block.acquire(blocking, timeout)
-            if rc:
-                self._owner = _get_ident()
-                self._count = 1
-            return rc
-        except AlreadyAcquired:
+        me = _get_ident()
+        if self._owner == me:
             self._count += 1
-            return 1
+            return self._count
+        rc = self._block.acquire(blocking, timeout)
+        if rc:
+            self._owner = me
+            self._count = 1
+        return rc
 
     __enter__ = acquire
 
@@ -229,15 +260,13 @@ class RedisRLock(RedisTools):
         There is no return value.
 
         """
-        if not self._count:
-            raise NotAcquired("cannot release un-acquired lock")
-        if self._is_owned():
-            self._count -= 1
-            if not self._count:
-                self._owner = None
-                self._block.release()
-        else:
-            raise InvalidOperator("cannot release rlock by other thread or process")
+        if self._owner != _get_ident() and self._count == 0:
+            raise InvalidOperator("cannot release lock by other thread or process")
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+            self._block.release()
+        return self._count
 
     def __exit__(self, t, v, tb):
         self.release()
@@ -245,10 +274,7 @@ class RedisRLock(RedisTools):
     # Internal methods used by condition variables
 
     def _acquire_restore(self, state):
-        try:
-            self._block.acquire()
-        except AlreadyAcquired:
-            pass
+        self._block.acquire()
         self._count, self._owner = state
 
     def _release_save(self):
@@ -310,7 +336,8 @@ class RedisCondition(RedisTools):
             self._is_owned = lock._is_owned
         except AttributeError:
             pass
-        self._waiters = _deque()
+        self._waiters_key = self.key + ":RedisDeque:_waiters"
+        self._waiters = RedisDeque(redis=self._redis, key=self._waiters_key)
 
     def __enter__(self):
         return self._lock.__enter__()
@@ -361,12 +388,14 @@ class RedisCondition(RedisTools):
         """
         if not self._is_owned():
             raise RuntimeError("cannot wait on un-acquired lock")
-        waiter = threading.Lock()
+        waiter = RedisLock(redis=self._redis)
         waiter.acquire()
-        self._waiters.append(waiter)
+        _logger.debug("add new waiter <%s>" % str(waiter))
+        self._waiters.append(waiter.key)
         saved_state = self._release_save()
         gotit = False
         try:  # restore state no matter what (e.g., KeyboardInterrupt)
+            _logger.debug("try get waiter <%s> 's lock" % str(waiter))
             if timeout is None:
                 waiter.acquire()
                 gotit = True
@@ -375,12 +404,14 @@ class RedisCondition(RedisTools):
                     gotit = waiter.acquire(True, timeout)
                 else:
                     gotit = waiter.acquire(False)
+            _logger.debug("finish got waiter <%s> 's lock" % str(waiter))
             return gotit
         finally:
             self._acquire_restore(saved_state)
             if not gotit:
                 try:
-                    self._waiters.remove(waiter)
+                    self._waiters.remove(waiter.key)
+                    _logger.debug("remove a waiter <%s>" % str(waiter))
                 except ValueError:
                     pass
 
@@ -421,13 +452,21 @@ class RedisCondition(RedisTools):
             raise RuntimeError("cannot notify on un-acquired lock")
         all_waiters = self._waiters
         waiters_to_notify = _deque(_islice(all_waiters, n))
+        _logger.debug("waiters_to_notify <%s>" % str(waiters_to_notify))
         if not waiters_to_notify:
             return
-        for waiter in waiters_to_notify:
-            waiter.release()
+        for waiter_key in waiters_to_notify:
+            _logger.debug(waiter_key)
+            waiter = RedisLock(redis=self._redis, key=waiter_key)
             try:
-                all_waiters.remove(waiter)
-            except ValueError:
+                waiter.release()
+                _logger.debug("release a waiter <%s>" % str(waiter))
+                try:
+                    all_waiters.remove(waiter_key)
+                    _logger.debug("remove a waiter <%s>" % str(waiter))
+                except ValueError:
+                    pass
+            except InvalidOperator:
                 pass
 
     def notify_all(self):
@@ -958,6 +997,7 @@ class RedisQueue(RedisTools):
                             raise Full
                         self.not_full.wait(remaining)
             self._put(item)
+            _logger.debug('finish putting "%s"' % str(item))
             self._class_dict["unfinished_tasks"] += 1
             self.not_empty.notify()
 
@@ -978,7 +1018,9 @@ class RedisQueue(RedisTools):
                     raise Empty
             elif timeout is None:
                 while not self._qsize():
+                    _logger.debug('start a not_empty.wait')
                     self.not_empty.wait()
+                    _logger.debug('finish a not_empty.wait')
             elif timeout < 0:
                 raise ValueError("'timeout' must be a non-negative number")
             else:
@@ -989,6 +1031,7 @@ class RedisQueue(RedisTools):
                         raise Empty
                     self.not_empty.wait(remaining)
             item = self._get()
+            _logger.debug('finish got "%s"' % str(item))
             self.not_full.notify()
             return item
 
@@ -1066,3 +1109,10 @@ class LifoRedisQueue(RedisQueue):
 
     def _get(self):
         return self.queue.pop()
+
+
+def open_debug():
+    import sys
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s{%(name)s}%(filename)s[line:%(lineno)d]<%(funcName)s> %(process)d %(threadName)s %(levelname)s : %(message)s',
+                        datefmt='%H:%M:%S', stream=sys.stdout)
