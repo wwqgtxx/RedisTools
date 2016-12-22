@@ -190,14 +190,15 @@ class RedisRLock(RedisTools):
         been acquired, false if the timeout has elapsed.
 
         """
-        if self._is_owned():
+        try:
+            rc = self._block.acquire(blocking, timeout)
+            if rc:
+                self._owner = _get_ident()
+                self._count = 1
+            return rc
+        except AlreadyAcquired:
             self._count += 1
             return 1
-        rc = self._block.acquire(blocking, timeout)
-        if rc:
-            self._owner = _get_ident()
-            self._count = 1
-        return rc
 
     __enter__ = acquire
 
@@ -217,12 +218,15 @@ class RedisRLock(RedisTools):
         There is no return value.
 
         """
-        if not self._is_owned():
-            raise RuntimeError("cannot release un-acquired lock")
-        self._count -= 1
         if not self._count:
-            self._owner = None
-            self._block.release()
+            raise RuntimeError("cannot release un-acquired lock")
+        if self._is_owned():
+            self._count -= 1
+            if not self._count:
+                self._owner = None
+                self._block.release()
+        else:
+            raise RuntimeError("cannot release rlock by other thread or process")
 
     def __exit__(self, t, v, tb):
         self.release()
@@ -230,11 +234,10 @@ class RedisRLock(RedisTools):
     # Internal methods used by condition variables
 
     def _acquire_restore(self, state):
-        if not self._is_owned():
-            try:
-                self._block.acquire()
-            except AlreadyAcquired:
-                pass
+        try:
+            self._block.acquire()
+        except AlreadyAcquired:
+            pass
         self._count, self._owner = state
 
     def _release_save(self):
@@ -271,8 +274,8 @@ class RedisCondition(RedisTools):
             key = self._create_key()
         self.key = key
         self._redis = redis or Redis()
-        if not isinstance(lock, RedisRLock):
-            _logger.warning("the lock is not a RedisRLock,try to new a RedisRLock")
+        if not isinstance(lock, RedisLock):
+            _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
             lock = RedisRLock(redis=self._redis, key=self._lock_key)
         else:
@@ -825,7 +828,7 @@ class RedisQueue(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self.mutex_key = self.key + ":RedisRLock:mutex_key"
+        self.mutex_key = self.key + ":RedisLock:mutex_key"
         self.not_empty_key = self.key + ":RedisCondition:not_empty"
         self.not_full_key = self.key + ":RedisCondition:not_full"
         self.all_tasks_done_key = self.key + ":RedisCondition:all_tasks_done"
@@ -840,7 +843,7 @@ class RedisQueue(RedisTools):
         # that acquire mutex must release it before returning.  mutex
         # is shared between the three conditions, so acquiring and
         # releasing the conditions also acquires and releases mutex.
-        self.mutex = RedisRLock(redis=self._redis, key=self.mutex_key)
+        self.mutex = RedisLock(redis=self._redis, key=self.mutex_key)
 
         # Notify not_empty whenever an item is added to the queue; a
         # thread waiting to get is notified then.
