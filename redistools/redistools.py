@@ -21,12 +21,13 @@ try:
 except ImportError:
     from collections import deque as _deque
 
-from redis import Redis
+from redis import StrictRedis as _StrictRedis
+from redis import ConnectionPool as _ConnectionPool
 import redis_collections
 import logging
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.DEBUG)
+_logger.setLevel(logging.INFO)
 
 
 # logging.getLogger("redis_lock").setLevel(logging.INFO)
@@ -65,6 +66,13 @@ class InvalidOperator(RuntimeError):
     pass
 
 
+def _clone_same_redis(redis):
+    connection_kwargs = redis.connection_pool.connection_kwargs
+    connection_pool = _ConnectionPool(**connection_kwargs)
+    new_redis = _StrictRedis(connection_pool=connection_pool)
+    return new_redis
+
+
 class RedisLock(RedisTools):
     def __init__(self, redis=None, key=None, expire=None, care_operator=False):
         """
@@ -79,8 +87,10 @@ class RedisLock(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        redis = redis or Redis()
-        self._redis = redis
+        if redis:
+            self._redis = _clone_same_redis(redis)
+        else:
+            self._redis = _StrictRedis()
         self._expire = expire if expire is None else int(expire)
         self._name = key + ":_name"
         self._signal = key + ":_signal"
@@ -102,13 +112,13 @@ class RedisLock(RedisTools):
         timed_out = False
         while busy:
             busy = not self._redis.set(self._name, self.key, nx=True, ex=self._expire)
-            _logger.debug("busy=" + str(busy))
+            # _logger.debug("busy=" + str(busy))
             if busy:
                 if timed_out:
                     return False
                 elif blocking:
                     timed_out = not self._redis.blpop(self._signal, blpop_timeout) and timeout
-                    _logger.debug("timeout=" + str(timeout))
+                    # _logger.debug("timeout=" + str(timeout))
                 else:
                     _logger.debug("Failed to get %r.", self._name)
                     return False
@@ -143,7 +153,7 @@ class RedisLock(RedisTools):
             pipe.delete(self._name)
             # pipe.delete(self._signal)
             result = pipe.execute()
-            _logger.debug(result)
+            # _logger.debug(result)
         self._owner = None
 
     def _delete_signal(self):
@@ -310,7 +320,7 @@ class RedisCondition(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self._redis = redis or Redis()
+        self._redis = redis or _StrictRedis()
         if not isinstance(lock, RedisLock):
             _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
@@ -464,10 +474,10 @@ class RedisCondition(RedisTools):
                 try:
                     all_waiters.remove(waiter_key)
                     _logger.debug("remove a waiter <%s>" % str(waiter))
-                except ValueError:
-                    pass
+                except:
+                    _logger.warning("can't remove waiter <%s>" % str(waiter), exc_info=True)
             except InvalidOperator:
-                pass
+                _logger.warning("can't release waiter <%s>" % str(waiter), exc_info=True)
 
     def notify_all(self):
         """Wake up all threads waiting on this condition.
@@ -497,7 +507,7 @@ class RedisSemaphore(RedisTools):
     def __init__(self, value=1, redis=None, key=None):
         if value < 0:
             raise ValueError("semaphore initial value must be >= 0")
-        self._redis = redis or Redis()
+        self._redis = redis or _StrictRedis()
         if not key:
             key = self._create_key()
         self.key = key
@@ -623,7 +633,7 @@ class RedisEvent(RedisTools):
     # After Tim Peters' event class (without is_posted())
 
     def __init__(self, redis=None, key=None):
-        self._redis = redis or Redis()
+        self._redis = redis or _StrictRedis()
         if not key:
             key = self._create_key()
         self.key = key
@@ -708,7 +718,7 @@ class RedisBarrier(RedisTools):
         default for all subsequent 'wait()' calls.
 
         """
-        self._redis = redis or Redis()
+        self._redis = redis or _StrictRedis()
         if not key:
             key = self._create_key()
         self.key = key
@@ -868,7 +878,7 @@ class RedisQueue(RedisTools):
     '''
 
     def __init__(self, maxsize=0, redis=None, key=None):
-        self._redis = redis or Redis()
+        self._redis = redis or _StrictRedis()
         if not key:
             key = self._create_key()
         self.key = key
@@ -1114,5 +1124,6 @@ class LifoRedisQueue(RedisQueue):
 def open_debug():
     import sys
     logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s{%(name)s}%(filename)s[line:%(lineno)d]<%(funcName)s> %(process)d %(threadName)s %(levelname)s : %(message)s',
+                        format='%(asctime)s{%(name)s}%(filename)s[line:%(lineno)d]<%(funcName)s> pid:%(process)d %(threadName)s %(levelname)s : %(message)s',
                         datefmt='%H:%M:%S', stream=sys.stdout)
+    _logger.setLevel(logging.DEBUG)
