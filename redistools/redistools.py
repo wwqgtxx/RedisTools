@@ -138,11 +138,11 @@ class RedisLock(RedisTools):
     def release(self):
         if (not self.care_operator) or self._owner == _get_ident():
             _logger.debug("Releasing %r.", self.key)
-            self.reset()
+            self.reset(need_delete_signal=False)
         else:
             raise InvalidOperator("cannot release lock by other thread or process")
 
-    def reset(self):
+    def reset(self, need_delete_signal=True):
         """
         Forcibly deletes the lock. Use this with care.
         """
@@ -155,7 +155,8 @@ class RedisLock(RedisTools):
             result = pipe.execute()
             # _logger.debug(result)
         self._owner = None
-        self._delete_signal()
+        if need_delete_signal:
+            self._delete_signal()
 
     def _delete_signal(self):
         self._redis.delete(self._signal)
