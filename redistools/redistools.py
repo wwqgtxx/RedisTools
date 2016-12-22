@@ -7,6 +7,7 @@ from future import standard_library
 
 standard_library.install_aliases()
 from builtins import *
+import os
 import uuid
 import queue
 import threading
@@ -23,6 +24,13 @@ except ImportError:
 from redis import Redis
 import redis_collections
 import redis_lock
+import logging
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
+
+
+# logging.getLogger("redis_lock").setLevel(logging.INFO)
 
 
 class RedisTools(_ABC):
@@ -39,7 +47,10 @@ class RedisList(RedisTools, redis_collections.List):
 
 
 class RedisDeque(RedisTools, redis_collections.Deque):
-    pass
+    def remove(self, value):
+        _logger.debug(str(self.key))
+        _logger.debug(str(value))
+        super(RedisDeque, self).remove(value)
 
 
 class RedisCounter(RedisTools, redis_collections.Counter):
@@ -85,6 +96,16 @@ class RedisLock(RedisTools, redis_lock.Lock):
         redis = redis or Redis()
         super(RedisLock, self).__init__(redis_client=redis, name=key, expire=expire,
                                         auto_renewal=auto_renewal)
+        self._id = self._get_id
+
+    @property
+    def _get_id(self):
+        # _logger.debug("_get_id()")
+        return _get_ident().encode()
+
+    @property
+    def _held(self):
+        return self.id == self.get_owner_id()
 
     def _release_save(self):
         self.release()  # No state to save
@@ -94,14 +115,22 @@ class RedisLock(RedisTools, redis_lock.Lock):
 
     def _is_owned(self):
         # Return True if lock is owned by current_thread.
-        if self.acquire(blocking=False):
+        return self._held
+
+    def locked(self):
+        if self._is_owned():
+            return True
+        elif self.acquire(blocking=False):
             self.release()
             return False
         else:
             return True
 
-    def locked(self):
-        return self._is_owned()
+
+def _get_ident():
+    result = "<pid:%s,thread_id:%s>" % (str(os.getpid()), str(threading.get_ident()))
+    # _logger.debug(result)
+    return result
 
 
 # modify from python35's threading.py
@@ -121,17 +150,12 @@ class RedisRLock(RedisTools):
         self.key = key
         self._block_key = self.key + ":RedisLock:_block"
         self._block = RedisLock(redis=redis, key=self._block_key, expire=expire, auto_renewal=auto_renewal)
-        self.key = self._block.key
         self._owner = None
         self._count = 0
 
     def __repr__(self):
         owner = self._owner
-        try:
-            owner = threading._active[owner].name
-        except KeyError:
-            pass
-        return "<%s %s.%s object owner=%r count=%d at %s>" % (
+        return "<%s %s.%s object owner=%s count=%d at %s>" % (
             "locked" if self._block.locked() else "unlocked",
             self.__class__.__module__,
             self.__class__.__qualname__,
@@ -140,7 +164,7 @@ class RedisRLock(RedisTools):
             hex(id(self))
         )
 
-    def acquire(self, blocking=True, timeout=-1):
+    def acquire(self, blocking=True, timeout=None):
         """Acquire a lock, blocking or non-blocking.
 
         When invoked without arguments: if this thread already owns the lock,
@@ -166,13 +190,12 @@ class RedisRLock(RedisTools):
         been acquired, false if the timeout has elapsed.
 
         """
-        me = threading.get_ident()
-        if self._owner == me:
+        if self._is_owned():
             self._count += 1
             return 1
         rc = self._block.acquire(blocking, timeout)
         if rc:
-            self._owner = me
+            self._owner = _get_ident()
             self._count = 1
         return rc
 
@@ -194,10 +217,10 @@ class RedisRLock(RedisTools):
         There is no return value.
 
         """
-        if self._owner != threading.get_ident():
+        if not self._is_owned():
             raise RuntimeError("cannot release un-acquired lock")
-        self._count = count = self._count - 1
-        if not count:
+        self._count -= 1
+        if not self._count:
             self._owner = None
             self._block.release()
 
@@ -207,7 +230,11 @@ class RedisRLock(RedisTools):
     # Internal methods used by condition variables
 
     def _acquire_restore(self, state):
-        self._block.acquire()
+        if not self._is_owned():
+            try:
+                self._block.acquire()
+            except AlreadyAcquired:
+                pass
         self._count, self._owner = state
 
     def _release_save(self):
@@ -221,7 +248,9 @@ class RedisRLock(RedisTools):
         return (count, owner)
 
     def _is_owned(self):
-        return self._owner == threading.get_ident()
+        # _logger.debug([self._owner, _get_ident(),self._owner == _get_ident()])
+        # return self._owner == _get_ident()
+        return self._block._is_owned()
 
 
 # modify from python35's threading.py
@@ -242,7 +271,8 @@ class RedisCondition(RedisTools):
             key = self._create_key()
         self.key = key
         self._redis = redis or Redis()
-        if not isinstance(lock, RedisLock):
+        if not isinstance(lock, RedisRLock):
+            _logger.warning("the lock is not a RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
             lock = RedisRLock(redis=self._redis, key=self._lock_key)
         else:
@@ -318,7 +348,7 @@ class RedisCondition(RedisTools):
         """
         if not self._is_owned():
             raise RuntimeError("cannot wait on un-acquired lock")
-        waiter = RedisLock(redis=self._redis)
+        waiter = RedisRLock(redis=self._redis)
         waiter.acquire()
         self._waiters.append(waiter.key)
         saved_state = self._release_save()
@@ -381,14 +411,15 @@ class RedisCondition(RedisTools):
         if not waiters_to_notify:
             return
         for waiter_key in waiters_to_notify:
+            _logger.debug(waiter_key)
             waiter = RedisLock(redis=self._redis, key=waiter_key)
             try:
                 waiter.release()
-            except NotAcquired:
+            except:
                 pass
             try:
                 all_waiters.remove(waiter_key)
-            except ValueError:
+            except:
                 pass
 
     def notify_all(self):
@@ -634,11 +665,11 @@ class RedisBarrier(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self._lock_key = self.key + ":RedisLock:_lock"
+        self._lock_key = self.key + ":RedisRLock:_lock"
         self._cond_key = self.key + ":RedisCondition:_cond"
         self._class_dict_key = self.key + ":RedisDict:_class_dict"
         self._class_dict = RedisDict(redis=self._redis, key=self._class_dict_key)
-        self._lock = RedisLock(redis=self._redis, key=self._lock_key)
+        self._lock = RedisRLock(redis=self._redis, key=self._lock_key)
         self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
         self._class_dict["_action"] = self._class_dict.get("_action", action)
         self._class_dict["_timeout"] = self._class_dict.get("_timeout", timeout)
@@ -794,7 +825,7 @@ class RedisQueue(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self.mutex_key = self.key + ":RedisLock:mutex_key"
+        self.mutex_key = self.key + ":RedisRLock:mutex_key"
         self.not_empty_key = self.key + ":RedisCondition:not_empty"
         self.not_full_key = self.key + ":RedisCondition:not_full"
         self.all_tasks_done_key = self.key + ":RedisCondition:all_tasks_done"
@@ -809,19 +840,19 @@ class RedisQueue(RedisTools):
         # that acquire mutex must release it before returning.  mutex
         # is shared between the three conditions, so acquiring and
         # releasing the conditions also acquires and releases mutex.
-        self.mutex = RedisLock(redis=self._redis, key=self.mutex_key)
+        self.mutex = RedisRLock(redis=self._redis, key=self.mutex_key)
 
         # Notify not_empty whenever an item is added to the queue; a
         # thread waiting to get is notified then.
-        self.not_empty = RedisCondition(self.mutex, redis=self._redis, key=self.not_empty_key)
+        self.not_empty = RedisCondition(lock=self.mutex, redis=self._redis, key=self.not_empty_key)
 
         # Notify not_full whenever an item is removed from the queue;
         # a thread waiting to put is notified then.
-        self.not_full = RedisCondition(self.mutex, redis=self._redis, key=self.not_full_key)
+        self.not_full = RedisCondition(lock=self.mutex, redis=self._redis, key=self.not_full_key)
 
         # Notify all_tasks_done whenever the number of unfinished tasks
         # drops to zero; thread waiting to join() is notified to resume
-        self.all_tasks_done = RedisCondition(self.mutex, redis=self._redis, key=self.all_tasks_done_key)
+        self.all_tasks_done = RedisCondition(lock=self.mutex, redis=self._redis, key=self.all_tasks_done_key)
         # self.unfinished_tasks = 0
         self._class_dict["unfinished_tasks"] = 0
 
