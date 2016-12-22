@@ -47,10 +47,7 @@ class RedisList(RedisTools, redis_collections.List):
 
 
 class RedisDeque(RedisTools, redis_collections.Deque):
-    def remove(self, value):
-        _logger.debug(str(self.key))
-        _logger.debug(str(value))
-        super(RedisDeque, self).remove(value)
+    pass
 
 
 class RedisCounter(RedisTools, redis_collections.Counter):
@@ -68,6 +65,10 @@ TimeoutNotUsable = redis_lock.TimeoutNotUsable
 InvalidTimeout = redis_lock.InvalidTimeout
 TimeoutTooLarge = redis_lock.TimeoutTooLarge
 NotExpirable = redis_lock.NotExpirable
+
+
+class InvalidOperator(RuntimeError):
+    pass
 
 
 class RedisLock(RedisTools, redis_lock.Lock):
@@ -94,19 +95,28 @@ class RedisLock(RedisTools, redis_lock.Lock):
             key = self._create_key()
         self.key = key
         redis = redis or Redis()
-        super(RedisLock, self).__init__(redis_client=redis, name=key, expire=expire,
+        super(RedisLock, self).__init__(redis_client=redis, name=key, expire=expire, id=key.encode(),
                                         auto_renewal=auto_renewal)
         self._owner = None
 
     @property
     def _held(self):
-        return self._owner == _get_ident() and super(RedisLock, self)._held
+        return self._owner == _get_ident()
 
     def acquire(self, blocking=True, timeout=None):
+        if self._owner == _get_ident():
+            raise InvalidOperator("Already acquired lock by this process and this thread")
         result = super(RedisLock, self).acquire(blocking, timeout)
         if result:
             self._owner = _get_ident()
         return result
+
+    def release(self):
+        if self._owner == _get_ident():
+            super(RedisLock, self).release()
+            self._owner = None
+        else:
+            raise InvalidOperator("cannot release lock by other thread or process")
 
     def _release_save(self):
         self.release()  # No state to save
@@ -220,14 +230,14 @@ class RedisRLock(RedisTools):
 
         """
         if not self._count:
-            raise RuntimeError("cannot release un-acquired lock")
+            raise NotAcquired("cannot release un-acquired lock")
         if self._is_owned():
             self._count -= 1
             if not self._count:
                 self._owner = None
                 self._block.release()
         else:
-            raise RuntimeError("cannot release rlock by other thread or process")
+            raise InvalidOperator("cannot release rlock by other thread or process")
 
     def __exit__(self, t, v, tb):
         self.release()
@@ -300,8 +310,7 @@ class RedisCondition(RedisTools):
             self._is_owned = lock._is_owned
         except AttributeError:
             pass
-        self._waiters_key = self.key + ":RedisDeque:_waiters"
-        self._waiters = RedisDeque(redis=self._redis, key=self._waiters_key)
+        self._waiters = _deque()
 
     def __enter__(self):
         return self._lock.__enter__()
@@ -352,9 +361,9 @@ class RedisCondition(RedisTools):
         """
         if not self._is_owned():
             raise RuntimeError("cannot wait on un-acquired lock")
-        waiter = RedisRLock(redis=self._redis)
+        waiter = threading.Lock()
         waiter.acquire()
-        self._waiters.append(waiter.key)
+        self._waiters.append(waiter)
         saved_state = self._release_save()
         gotit = False
         try:  # restore state no matter what (e.g., KeyboardInterrupt)
@@ -371,7 +380,7 @@ class RedisCondition(RedisTools):
             self._acquire_restore(saved_state)
             if not gotit:
                 try:
-                    self._waiters.remove(waiter.key)
+                    self._waiters.remove(waiter)
                 except ValueError:
                     pass
 
@@ -414,16 +423,11 @@ class RedisCondition(RedisTools):
         waiters_to_notify = _deque(_islice(all_waiters, n))
         if not waiters_to_notify:
             return
-        for waiter_key in waiters_to_notify:
-            _logger.debug(waiter_key)
-            waiter = RedisLock(redis=self._redis, key=waiter_key)
+        for waiter in waiters_to_notify:
+            waiter.release()
             try:
-                waiter.release()
-            except:
-                pass
-            try:
-                all_waiters.remove(waiter_key)
-            except:
+                all_waiters.remove(waiter)
+            except ValueError:
                 pass
 
     def notify_all(self):
