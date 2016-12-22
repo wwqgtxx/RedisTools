@@ -120,10 +120,10 @@ class RedisLock(RedisTools):
                     timed_out = not self._redis.blpop(self._signal, blpop_timeout) and timeout
                     # _logger.debug("timeout=" + str(timeout))
                 else:
-                    _logger.debug("Failed to get %r.", self._name)
+                    _logger.debug("Failed to get %r.", self.key)
                     return False
 
-        _logger.debug("Got lock for %r.", self._name)
+        _logger.debug("Got lock for %r.", self.key)
         self._owner = _get_ident()
         return True
 
@@ -137,7 +137,7 @@ class RedisLock(RedisTools):
 
     def release(self):
         if (not self.care_operator) or self._owner == _get_ident():
-            _logger.debug("Releasing %r.", self._name)
+            _logger.debug("Releasing %r.", self.key)
             self.reset()
         else:
             raise InvalidOperator("cannot release lock by other thread or process")
@@ -155,6 +155,7 @@ class RedisLock(RedisTools):
             result = pipe.execute()
             # _logger.debug(result)
         self._owner = None
+        self._delete_signal()
 
     def _delete_signal(self):
         self._redis.delete(self._signal)
