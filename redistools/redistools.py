@@ -138,11 +138,11 @@ class RedisLock(RedisTools):
     def release(self):
         if (not self.care_operator) or self._owner == _get_ident():
             _logger.debug("Releasing %r.", self.key)
-            self.reset(need_delete_signal=False)
+            self.reset(need_delete_all=False)
         else:
             raise InvalidOperator("cannot release lock by other thread or process")
 
-    def reset(self, need_delete_signal=True):
+    def reset(self, need_delete_all=True):
         """
         Forcibly deletes the lock. Use this with care.
         """
@@ -155,11 +155,15 @@ class RedisLock(RedisTools):
             result = pipe.execute()
             # _logger.debug(result)
         self._owner = None
-        if need_delete_signal:
-            self._delete_signal()
+        if need_delete_all:
+            self._delete_all()
 
-    def _delete_signal(self):
-        self._redis.delete(self._signal)
+    def _delete_all(self):
+        pipe = self._redis.pipeline()
+        with pipe:
+            pipe.delete(self._signal)
+            pipe.delete(self._name)
+            result = pipe.execute()
 
     def _release_save(self):
         self.release()  # No state to save
@@ -426,6 +430,7 @@ class RedisCondition(RedisTools):
                     _logger.debug("remove a waiter <%s>" % str(waiter))
                 except ValueError:
                     pass
+            waiter.reset()
 
     def wait_for(self, predicate, timeout=None):
         """Wait until a condition evaluates to True.
