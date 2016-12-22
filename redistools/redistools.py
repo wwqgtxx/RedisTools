@@ -30,9 +30,6 @@ _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
 
 
-# logging.getLogger("redis_lock").setLevel(logging.INFO)
-
-
 class RedisTools(_ABC):
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
@@ -55,10 +52,6 @@ class RedisCounter(RedisTools, redis_collections.Counter):
 
 
 class RedisDefaultDict(RedisTools, redis_collections.DefaultDict):
-    pass
-
-
-class InvalidTimeout(RuntimeError):
     pass
 
 
@@ -102,26 +95,26 @@ class RedisLock(RedisTools):
             raise InvalidOperator("Already acquired lock by this process and this thread")
         timeout = timeout if timeout is None else int(timeout)
         if timeout is not None and timeout <= 0:
-            raise InvalidTimeout("Timeout (%d) cannot be less than or equal to 0" % timeout)
+            timeout = None
 
         if timeout and self._expire and timeout > self._expire:
-            raise InvalidTimeout("Timeout (%s) cannot be greater than expire (%d)" % (str(timeout), self._expire))
+            _logger.warning("Timeout (%s) cannot be greater than expire (%d)" % (str(timeout), self._expire))
+            timeout = self._expire
 
-        busy = True
         blpop_timeout = timeout or self._expire or 0
-        timed_out = False
-        while busy:
-            busy = not self._redis.set(self._name, self.key, nx=True, ex=self._expire)
-            # _logger.debug("busy=" + str(busy))
-            if busy:
-                if timed_out:
+        is_time_out = False
+        while True:
+            is_locked = not self._redis.set(self._name, self.key, nx=True, ex=self._expire)
+            if is_locked:
+                if is_time_out:
                     return False
                 elif blocking:
-                    timed_out = not self._redis.blpop(self._signal, blpop_timeout) and timeout
-                    # _logger.debug("timeout=" + str(timeout))
+                    is_time_out = not self._redis.blpop(self._signal, blpop_timeout) and timeout
                 else:
                     _logger.debug("Failed to get %r.", self.key)
                     return False
+            else:
+                break
 
         _logger.debug("Got lock for %r.", self.key)
         self._owner = _get_ident()
@@ -327,7 +320,7 @@ class RedisCondition(RedisTools):
             key = self._create_key()
         self.key = key
         self._redis = redis or _StrictRedis()
-        if not isinstance(lock, RedisLock):
+        if not isinstance(lock, RedisLock) and not isinstance(lock, RedisRLock):
             _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
             lock = RedisRLock(redis=self._redis, key=self._lock_key)
