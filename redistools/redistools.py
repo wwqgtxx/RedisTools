@@ -17,14 +17,35 @@ class RedisDict(redis_collections.Dict):
     CLASS_PREFIX = "RedisDict:AutoUUID:"
 
     def _create_key(self):
-        return RedisDict.CLASS_PREFIX + (super(RedisDict, self)._create_key())
+        return RedisDict.CLASS_PREFIX + uuid.uuid4().hex
 
 
 class RedisList(redis_collections.List):
     CLASS_PREFIX = "RedisList:AutoUUID:"
 
     def _create_key(self):
-        return RedisList.CLASS_PREFIX + (super(RedisList, self)._create_key())
+        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+
+
+class RedisDeque(redis_collections.Deque):
+    CLASS_PREFIX = "RedisDeque:AutoUUID:"
+
+    def _create_key(self):
+        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+
+
+class RedisCounter(redis_collections.Counter):
+    CLASS_PREFIX = "RedisCounter:AutoUUID:"
+
+    def _create_key(self):
+        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+
+
+class RedisDefaultDict(redis_collections.DefaultDict):
+    CLASS_PREFIX = "RedisDefaultDict:AutoUUID:"
+
+    def _create_key(self):
+        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
 
 
 class RedisLock(redis_lock.Lock):
