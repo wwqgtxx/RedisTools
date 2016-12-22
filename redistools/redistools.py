@@ -159,10 +159,13 @@ class RedisLock(RedisTools):
             result = pipe.execute()
 
     def _release_save(self):
-        self.release()  # No state to save
+        owner = self._owner
+        self.release()
+        return owner
 
     def _acquire_restore(self, x):
-        self.acquire()  # Ignore saved state
+        self.acquire()
+        self._owner = x
 
     def _is_owned(self):
         # Return True if lock is owned by current_thread.
