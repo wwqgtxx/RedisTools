@@ -13,6 +13,7 @@ import threading
 from itertools import islice as _islice, count as _count
 from time import monotonic as _time
 from heapq import heappush as _heappush, heappop as _heappop
+from abc import ABC as _ABC
 
 try:
     from _collections import deque as _deque
@@ -24,39 +25,29 @@ import redis_collections
 import redis_lock
 
 
-class RedisDict(redis_collections.Dict):
-    CLASS_PREFIX = "RedisDict:AutoUUID:"
-
+class RedisTools(_ABC):
     def _create_key(self):
-        return RedisDict.CLASS_PREFIX + uuid.uuid4().hex
+        return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
 
 
-class RedisList(redis_collections.List):
-    CLASS_PREFIX = "RedisList:AutoUUID:"
-
-    def _create_key(self):
-        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+class RedisDict(RedisTools, redis_collections.Dict):
+    pass
 
 
-class RedisDeque(redis_collections.Deque):
-    CLASS_PREFIX = "RedisDeque:AutoUUID:"
-
-    def _create_key(self):
-        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+class RedisList(RedisTools, redis_collections.List):
+    pass
 
 
-class RedisCounter(redis_collections.Counter):
-    CLASS_PREFIX = "RedisCounter:AutoUUID:"
-
-    def _create_key(self):
-        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+class RedisDeque(RedisTools, redis_collections.Deque):
+    pass
 
 
-class RedisDefaultDict(redis_collections.DefaultDict):
-    CLASS_PREFIX = "RedisDefaultDict:AutoUUID:"
+class RedisCounter(RedisTools, redis_collections.Counter):
+    pass
 
-    def _create_key(self):
-        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
+
+class RedisDefaultDict(RedisTools, redis_collections.DefaultDict):
+    pass
 
 
 AlreadyAcquired = redis_lock.AlreadyAcquired
@@ -68,12 +59,7 @@ TimeoutTooLarge = redis_lock.TimeoutTooLarge
 NotExpirable = redis_lock.NotExpirable
 
 
-class RedisLock(redis_lock.Lock):
-    CLASS_PREFIX = "RedisLock:AutoUUID:"
-
-    def _create_key(self):
-        return RedisList.CLASS_PREFIX + uuid.uuid4().hex
-
+class RedisLock(RedisTools, redis_lock.Lock):
     def __init__(self, redis=None, key=None, expire=None, auto_renewal=False):
         """
         :param redis:
@@ -119,7 +105,7 @@ class RedisLock(redis_lock.Lock):
 
 
 # modify from python35's threading.py
-class RedisRLock(object):
+class RedisRLock(RedisTools):
     """This class implements reentrant lock objects.
 
     A reentrant lock must be released by the thread that acquired it. Once a
@@ -129,8 +115,13 @@ class RedisRLock(object):
 
     """
 
-    def __init__(self, *args, **kwargs):
-        self._block = RedisLock(*args, **kwargs)
+    def __init__(self, redis=None, key=None, expire=None, auto_renewal=False):
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self._block_key = self.key + ":RedisLock:_block"
+        self._block = RedisLock(redis=redis, key=self._block_key, expire=expire, auto_renewal=auto_renewal)
+        self.key = self._block.key
         self._owner = None
         self._count = 0
 
@@ -234,7 +225,7 @@ class RedisRLock(object):
 
 
 # modify from python35's threading.py
-class RedisCondition(object):
+class RedisCondition(RedisTools):
     """Class that implements a condition variable.
 
     A condition variable allows one or more threads to wait until they are
@@ -246,10 +237,16 @@ class RedisCondition(object):
 
     """
 
-    def __init__(self, lock=None, redis=None):
+    def __init__(self, lock=None, redis=None, key=None):
+        if not key:
+            key = self._create_key()
+        self.key = key
         self._redis = redis or Redis()
         if not isinstance(lock, RedisLock):
-            lock = RedisRLock(redis=self._redis)
+            self._lock_key = self.key + ":RedisRLock:_lock"
+            lock = RedisRLock(redis=self._redis, key=self._lock_key)
+        else:
+            self._lock_key = lock.key
         self._lock = lock
         # Export the lock's acquire() and release() methods
         self.acquire = lock.acquire
@@ -269,7 +266,8 @@ class RedisCondition(object):
             self._is_owned = lock._is_owned
         except AttributeError:
             pass
-        self._waiters = RedisDeque(redis=self._redis)
+        self._waiters_key = self.key + ":RedisDeque:_waiters"
+        self._waiters = RedisDeque(redis=self._redis, key=self._waiters_key)
 
     def __enter__(self):
         return self._lock.__enter__()
@@ -406,7 +404,7 @@ class RedisCondition(object):
 
 
 # modify from python35's threading.py
-class RedisSemaphore(object):
+class RedisSemaphore(RedisTools):
     """This class implements semaphore objects.
 
     Semaphores manage a counter representing the number of release() calls minus
@@ -418,13 +416,20 @@ class RedisSemaphore(object):
 
     # After Tim Peters' semaphore class, but not quite the same (no maximum)
 
-    def __init__(self, value=1, redis=None):
+    def __init__(self, value=1, redis=None, key=None):
         if value < 0:
             raise ValueError("semaphore initial value must be >= 0")
         self._redis = redis or Redis()
-        self._lock = RedisLock(redis=self._redis)
-        self._cond = RedisCondition(lock=self._lock, redis=self._redis)
-        self._value = value
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self._lock_key = self.key + ":RedisLock:_lock"
+        self._cond_key = self.key + ":RedisCondition:_cond"
+        self._class_dict_key = self.key + ":RedisDict:_class_dict"
+        self._class_dict = RedisDict(redis=self._redis, key=self._class_dict_key)
+        self._lock = RedisLock(redis=self._redis, key=self._lock_key)
+        self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
+        self._class_dict["_value"] = self._class_dict.get("_value", value)
 
     def acquire(self, blocking=True, timeout=None):
         """Acquire a semaphore, decrementing the internal counter by one.
@@ -455,7 +460,7 @@ class RedisSemaphore(object):
         rc = False
         endtime = None
         with self._cond:
-            while self._value == 0:
+            while self._class_dict["_value"] == 0:
                 if not blocking:
                     break
                 if timeout is not None:
@@ -467,7 +472,7 @@ class RedisSemaphore(object):
                             break
                 self._cond.wait(timeout)
             else:
-                self._value -= 1
+                self._class_dict["_value"] -= 1
                 rc = True
         return rc
 
@@ -481,7 +486,7 @@ class RedisSemaphore(object):
 
         """
         with self._cond:
-            self._value += 1
+            self._class_dict["_value"] += 1
             self._cond.notify()
 
     def __exit__(self, t, v, tb):
@@ -489,7 +494,7 @@ class RedisSemaphore(object):
 
 
 # modify from python35's threading.py
-class BoundedRedisSemaphore(RedisSemaphore):
+class RedisBoundedSemaphore(RedisSemaphore):
     """Implements a bounded semaphore.
 
     A bounded semaphore checks to make sure its current value doesn't exceed its
@@ -506,8 +511,8 @@ class BoundedRedisSemaphore(RedisSemaphore):
 
     """
 
-    def __init__(self, value=1, redis=None):
-        RedisSemaphore.__init__(self, value, redis=redis)
+    def __init__(self, value=1, redis=None, key=None):
+        RedisSemaphore.__init__(self, value, redis=redis, key=key)
         self._initial_value = value
 
     def release(self):
@@ -521,14 +526,14 @@ class BoundedRedisSemaphore(RedisSemaphore):
 
         """
         with self._cond:
-            if self._value >= self._initial_value:
+            if self._class_dict["_value"] >= self._initial_value:
                 raise ValueError("Semaphore released too many times")
-            self._value += 1
+            self._class_dict["_value"] += 1
             self._cond.notify()
 
 
 # modify from python35's threading.py
-class RedisEvent(object):
+class RedisEvent(RedisTools):
     """Class implementing event objects.
 
     Events manage a flag that can be set to true with the set() method and reset
@@ -539,16 +544,23 @@ class RedisEvent(object):
 
     # After Tim Peters' event class (without is_posted())
 
-    def __init__(self, redis=None):
+    def __init__(self, redis=None, key=None):
         self._redis = redis or Redis()
-        self._lock = RedisLock(redis=self._redis)
-        self._cond = RedisCondition(lock=self._lock, redis=self._redis)
-        self._flag = False
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self._lock_key = self.key + ":RedisLock:_lock"
+        self._cond_key = self.key + ":RedisCondition:_cond"
+        self._class_dict_key = self.key + ":RedisDict:_class_dict"
+        self._class_dict = RedisDict(redis=self._redis, key=self._class_dict_key)
+        self._lock = RedisLock(redis=self._redis, key=self._lock_key)
+        self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
+        self._class_dict["_flag"] = self._class_dict.get("_flag", False)
 
     def _reset_internal_locks(self):
         # private!  called by Thread._reset_internal_locks by _after_fork()
-        self._lock = RedisLock(redis=self._redis)
-        self._cond = RedisCondition(lock=self._lock, redis=self._redis)
+        self._lock = RedisLock(redis=self._redis, key=self._lock_key)
+        self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
 
     def is_set(self):
         """Return true if and only if the internal flag is true."""
@@ -600,7 +612,7 @@ class RedisEvent(object):
 
 
 # modify from python35's threading.py
-class RedisBarrier(object):
+class RedisBarrier(RedisTools):
     """Implements a Barrier.
 
     Useful for synchronizing a fixed number of threads at known synchronization
@@ -609,7 +621,7 @@ class RedisBarrier(object):
 
     """
 
-    def __init__(self, parties, action=None, timeout=None, redis=None):
+    def __init__(self, parties, action=None, timeout=None, redis=None, key=None):
         """Create a barrier, initialised to 'parties' threads.
 
         'action' is a callable which, when supplied, will be called by one of
@@ -619,13 +631,21 @@ class RedisBarrier(object):
 
         """
         self._redis = redis or Redis()
-        self._lock = RedisLock(redis=self._redis)
-        self._cond = RedisCondition(lock=self._lock, redis=self._redis)
-        self._action = action
-        self._timeout = timeout
-        self._parties = parties
-        self._state = 0  # 0 filling, 1, draining, -1 resetting, -2 broken
-        self._count = 0
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self._lock_key = self.key + ":RedisLock:_lock"
+        self._cond_key = self.key + ":RedisCondition:_cond"
+        self._class_dict_key = self.key + ":RedisDict:_class_dict"
+        self._class_dict = RedisDict(redis=self._redis, key=self._class_dict_key)
+        self._lock = RedisLock(redis=self._redis, key=self._lock_key)
+        self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
+        self._class_dict["_action"] = self._class_dict.get("_action", action)
+        self._class_dict["_timeout"] = self._class_dict.get("_timeout", timeout)
+        self._class_dict["_parties"] = self._class_dict.get("_parties", parties)
+        self._class_dict["_state"] = self._class_dict.get("_state",
+                                                          0)  # 0 filling, 1, draining, -1 resetting, -2 broken
+        self._class_dict["_count"] = self._class_dict.get("_count", 0)
 
     def wait(self, timeout=None):
         """Wait for the barrier.
@@ -637,13 +657,13 @@ class RedisBarrier(object):
 
         """
         if timeout is None:
-            timeout = self._timeout
+            timeout = self._class_dict["_timeout"]
         with self._cond:
             self._enter()  # Block while the barrier drains.
-            index = self._count
-            self._count += 1
+            index = self._class_dict["_count"]
+            self._class_dict["_count"] += 1
             try:
-                if index + 1 == self._parties:
+                if index + 1 == self._class_dict["_parties"]:
                     # We release the barrier
                     self._release()
                 else:
@@ -651,29 +671,29 @@ class RedisBarrier(object):
                     self._wait(timeout)
                 return index
             finally:
-                self._count -= 1
+                self._class_dict["_count"] -= 1
                 # Wake up any threads waiting for barrier to drain.
                 self._exit()
 
     # Block until the barrier is ready for us, or raise an exception
     # if it is broken.
     def _enter(self):
-        while self._state in (-1, 1):
+        while self._class_dict["_state"] in (-1, 1):
             # It is draining or resetting, wait until done
             self._cond.wait()
         # see if the barrier is in a broken state
-        if self._state < 0:
+        if self._class_dict["_state"] < 0:
             raise BrokenBarrierError
-        assert self._state == 0
+        assert self._class_dict["_state"] == 0
 
     # Optionally run the 'action' and release the threads waiting
     # in the barrier.
     def _release(self):
         try:
-            if self._action:
-                self._action()
+            if self._class_dict["_action"]:
+                self._class_dict["_action"]()
             # enter draining state
-            self._state = 1
+            self._class_dict["_state"] = 1
             self._cond.notify_all()
         except:
             # an exception during the _action handler.  Break and reraise
@@ -683,21 +703,21 @@ class RedisBarrier(object):
     # Wait in the barrier until we are relased.  Raise an exception
     # if the barrier is reset or broken.
     def _wait(self, timeout):
-        if not self._cond.wait_for(lambda: self._state != 0, timeout):
+        if not self._cond.wait_for(lambda: self._class_dict["_state"] != 0, timeout):
             # timed out.  Break the barrier
             self._break()
             raise BrokenBarrierError
-        if self._state < 0:
+        if self._class_dict["_state"] < 0:
             raise BrokenBarrierError
-        assert self._state == 1
+        assert self._class_dict["_state"] == 1
 
     # If we are the last thread to exit the barrier, signal any threads
     # waiting for the barrier to drain.
     def _exit(self):
-        if self._count == 0:
-            if self._state in (-1, 1):
+        if self._class_dict["_count"] == 0:
+            if self._class_dict["_state"] in (-1, 1):
                 # resetting or draining
-                self._state = 0
+                self._class_dict["_state"] = 0
                 self._cond.notify_all()
 
     def reset(self):
@@ -708,16 +728,16 @@ class RedisBarrier(object):
 
         """
         with self._cond:
-            if self._count > 0:
-                if self._state == 0:
+            if self._class_dict["_count"] > 0:
+                if self._class_dict["_state"] == 0:
                     # reset the barrier, waking up threads
-                    self._state = -1
-                elif self._state == -2:
+                    self._class_dict["_state"] = -1
+                elif self._class_dict["_state"] == -2:
                     # was broken, set it to reset state
                     # which clears when the last thread exits
-                    self._state = -1
+                    self._class_dict["_state"] = -1
             else:
-                self._state = 0
+                self._class_dict["_state"] = 0
             self._cond.notify_all()
 
     def abort(self):
@@ -733,66 +753,77 @@ class RedisBarrier(object):
     def _break(self):
         # An internal error was detected.  The barrier is set to
         # a broken state all parties awakened.
-        self._state = -2
+        self._class_dict["_state"] = -2
         self._cond.notify_all()
 
     @property
     def parties(self):
         """Return the number of threads required to trip the barrier."""
-        return self._parties
+        return self._class_dict["_parties"]
 
     @property
     def n_waiting(self):
         """Return the number of threads currently waiting at the barrier."""
         # We don't need synchronization here since this is an ephemeral result
         # anyway.  It returns the correct value in the steady state.
-        if self._state == 0:
-            return self._count
+        if self._class_dict["_state"] == 0:
+            return self._class_dict["_count"]
         return 0
 
     @property
     def broken(self):
         """Return True if the barrier is in a broken state."""
-        return self._state == -2
+        return self._class_dict["_state"] == -2
 
 
 BrokenBarrierError = threading.BrokenBarrierError
-
 
 Empty = queue.Empty
 Full = queue.Full
 
 
 # modify from python35's queue.py
-class RedisQueue(object):
+class RedisQueue(RedisTools):
     '''Create a queue object with a given maximum size.
 
     If maxsize is <= 0, the queue size is infinite.
     '''
 
-    def __init__(self, maxsize=0, redis=None):
+    def __init__(self, maxsize=0, redis=None, key=None):
         self._redis = redis or Redis()
-        self.maxsize = maxsize
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self.mutex_key = self.key + ":RedisLock:mutex_key"
+        self.not_empty_key = self.key + ":RedisCondition:not_empty"
+        self.not_full_key = self.key + ":RedisCondition:not_full"
+        self.all_tasks_done_key = self.key + ":RedisCondition:all_tasks_done"
+        self._class_dict_key = self.key + ":RedisDict:_class_dict"
+
+        self._class_dict = RedisDict(redis=self._redis, key=self._class_dict_key)
+        self.maxsize = self._class_dict.get("maxsize", maxsize)
+        self._class_dict["maxsize"] = self.maxsize
         self._init(maxsize)
 
         # mutex must be held whenever the queue is mutating.  All methods
         # that acquire mutex must release it before returning.  mutex
         # is shared between the three conditions, so acquiring and
         # releasing the conditions also acquires and releases mutex.
-        self.mutex = RedisLock(redis=self._redis)
+        self.mutex = RedisLock(redis=self._redis, key=self.mutex_key)
 
         # Notify not_empty whenever an item is added to the queue; a
         # thread waiting to get is notified then.
-        self.not_empty = RedisCondition(self.mutex, redis=self._redis)
+        self.not_empty = RedisCondition(self.mutex, redis=self._redis, key=self.not_empty_key)
 
         # Notify not_full whenever an item is removed from the queue;
         # a thread waiting to put is notified then.
-        self.not_full = RedisCondition(self.mutex, redis=self._redis)
+        self.not_full = RedisCondition(self.mutex, redis=self._redis, key=self.not_full_key)
 
         # Notify all_tasks_done whenever the number of unfinished tasks
         # drops to zero; thread waiting to join() is notified to resume
-        self.all_tasks_done = RedisCondition(self.mutex, redis=self._redis)
-        self.unfinished_tasks = 0
+        self.all_tasks_done = RedisCondition(self.mutex, redis=self._redis, key=self.all_tasks_done_key)
+        # self.unfinished_tasks = 0
+        self._class_dict["unfinished_tasks"] = 0
 
     def task_done(self):
         '''Indicate that a formerly enqueued task is complete.
@@ -809,12 +840,12 @@ class RedisQueue(object):
         placed in the queue.
         '''
         with self.all_tasks_done:
-            unfinished = self.unfinished_tasks - 1
+            unfinished = self._class_dict["unfinished_tasks"] - 1
             if unfinished <= 0:
                 if unfinished < 0:
                     raise ValueError('task_done() called too many times')
                 self.all_tasks_done.notify_all()
-            self.unfinished_tasks = unfinished
+            self._class_dict["unfinished_tasks"] = unfinished
 
     def join(self):
         '''Blocks until all items in the Queue have been gotten and processed.
@@ -826,7 +857,7 @@ class RedisQueue(object):
         When the count of unfinished tasks drops to zero, join() unblocks.
         '''
         with self.all_tasks_done:
-            while self.unfinished_tasks:
+            while self._class_dict["unfinished_tasks"]:
                 self.all_tasks_done.wait()
 
     def qsize(self):
@@ -888,7 +919,7 @@ class RedisQueue(object):
                             raise Full
                         self.not_full.wait(remaining)
             self._put(item)
-            self.unfinished_tasks += 1
+            self._class_dict["unfinished_tasks"] += 1
             self.not_empty.notify()
 
     def get(self, block=True, timeout=None):
@@ -944,7 +975,8 @@ class RedisQueue(object):
 
     # Initialize the queue representation
     def _init(self, maxsize):
-        self.queue = RedisDeque(redis=self._redis)
+        self.queue_key = self.key + ":RedisDeque:queue_key"
+        self.queue = RedisDeque(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
         return len(self.queue)
@@ -966,7 +998,8 @@ class PriorityRedisQueue(RedisQueue):
     '''
 
     def _init(self, maxsize):
-        self.queue = RedisList(redis=self._redis)
+        self.queue_key = self.key + ":RedisList:queue_key"
+        self.queue = RedisList(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
         return len(self.queue)
@@ -983,7 +1016,8 @@ class LifoRedisQueue(RedisQueue):
     '''Variant of Queue that retrieves most recently added entries first.'''
 
     def _init(self, maxsize):
-        self.queue = RedisList(redis=self._redis)
+        self.queue_key = self.key + ":RedisList:queue_key"
+        self.queue = RedisList(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
         return len(self.queue)
