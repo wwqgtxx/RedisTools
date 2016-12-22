@@ -96,16 +96,17 @@ class RedisLock(RedisTools, redis_lock.Lock):
         redis = redis or Redis()
         super(RedisLock, self).__init__(redis_client=redis, name=key, expire=expire,
                                         auto_renewal=auto_renewal)
-        self._id = self._get_id
-
-    @property
-    def _get_id(self):
-        # _logger.debug("_get_id()")
-        return _get_ident().encode()
+        self._owner = None
 
     @property
     def _held(self):
-        return self.id == self.get_owner_id()
+        return self._owner == _get_ident() and super(RedisLock, self)._held
+
+    def acquire(self, blocking=True, timeout=None):
+        result = super(RedisLock, self).acquire(blocking, timeout)
+        if result:
+            self._owner = _get_ident()
+        return result
 
     def _release_save(self):
         self.release()  # No state to save
