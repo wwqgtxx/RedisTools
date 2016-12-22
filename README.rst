@@ -15,6 +15,6 @@ Import the collections from the top-level ``redistools`` package.
 
 Then use it as a standard multiprocessing.Manager <https://docs.python.org/3/library/multiprocessing.html#multiprocessing.managers.SyncManager>
 
-Notice: We didn't provide ``Array`` and ``Value`` in ``RedisManager``
+Notice: We didn't provide ``Array``  ``Value`` and ``Namespace`` in ``RedisManager``
 
 © 2016-? wwqgtxx
