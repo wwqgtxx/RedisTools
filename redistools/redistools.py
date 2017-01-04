@@ -84,16 +84,25 @@ class RedisLock(RedisTools):
             self._redis = _clone_same_redis(redis)
         else:
             self._redis = _StrictRedis()
-        self._expire = expire if expire is None else int(expire)
+        self._expire = expire if expire is None else RedisLock.to_int(expire)
         self._name = key + ":_name"
         self._signal = key + ":_signal"
         self._owner = None
         self.care_operator = care_operator
 
+    @staticmethod
+    def to_int(num):
+        num = float(num)
+        if num < 1:
+            num = 1
+        else:
+            num = int(num)
+        return num
+
     def acquire(self, blocking=True, timeout=None):
         if self.care_operator and self._owner == _get_ident():
             raise InvalidOperator("Already acquired lock by this process and this thread")
-        timeout = timeout if timeout is None else int(timeout)
+        timeout = timeout if timeout is None else RedisLock.to_int(timeout)
         if timeout is not None and timeout <= 0:
             timeout = None
 
