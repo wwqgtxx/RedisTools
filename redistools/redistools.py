@@ -613,7 +613,7 @@ class RedisBoundedSemaphore(RedisSemaphore):
 
     def __init__(self, value=1, redis=None, key=None):
         RedisSemaphore.__init__(self, value, redis=redis, key=key)
-        self._initial_value = value
+        self._class_dict["_initial_value"] = self._class_dict.get("_initial_value", value)
 
     def release(self):
         """Release a semaphore, incrementing the internal counter by one.
@@ -626,7 +626,7 @@ class RedisBoundedSemaphore(RedisSemaphore):
 
         """
         with self._cond:
-            if self._class_dict["_value"] >= self._initial_value:
+            if self._class_dict["_value"] >= self._class_dict["_initial_value"]:
                 raise ValueError("Semaphore released too many times")
             self._class_dict["_value"] += 1
             self._cond.notify()
