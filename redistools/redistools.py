@@ -12,9 +12,12 @@ import uuid
 import queue
 import threading
 from itertools import islice as _islice, count as _count
-from time import monotonic as _time
+from monotonic import monotonic as _time
 from heapq import heappush as _heappush, heappop as _heappop
-from abc import ABC as _ABC
+try:
+    from abc import ABC as _ABC
+except ImportError:
+    _ABC = object
 
 try:
     from _collections import deque as _deque
@@ -875,8 +878,12 @@ class RedisBarrier(RedisTools):
         """Return True if the barrier is in a broken state."""
         return self._class_dict["_state"] == -2
 
-
-BrokenBarrierError = threading.BrokenBarrierError
+try:
+    BrokenBarrierError = threading.BrokenBarrierError
+except AttributeError:
+    # exception raised by the Barrier class
+    class BrokenBarrierError(RuntimeError):
+        pass
 
 Empty = queue.Empty
 Full = queue.Full
