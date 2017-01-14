@@ -14,6 +14,7 @@ import threading
 from itertools import islice as _islice, count as _count
 from monotonic import monotonic as _time
 from heapq import heappush as _heappush, heappop as _heappop
+
 try:
     from abc import ABC as _ABC
 except ImportError:
@@ -23,6 +24,11 @@ try:
     from _collections import deque as _deque
 except ImportError:
     from collections import deque as _deque
+
+try:
+    from threading import get_ident as _theading_get_ident
+except ImportError:
+    from threading import _get_ident as _theading_get_ident
 
 from redis import StrictRedis as _StrictRedis
 from redis import ConnectionPool as _ConnectionPool
@@ -194,7 +200,7 @@ class RedisLock(RedisTools):
 
 
 def _get_ident():
-    result = "<pid:%s,thread_id:%s>" % (str(os.getpid()), str(threading.get_ident()))
+    result = "<pid:%s,thread_id:%s>" % (str(os.getpid()), str(_theading_get_ident()))
     # _logger.debug(result)
     return result
 
@@ -877,6 +883,7 @@ class RedisBarrier(RedisTools):
     def broken(self):
         """Return True if the barrier is in a broken state."""
         return self._class_dict["_state"] == -2
+
 
 try:
     BrokenBarrierError = threading.BrokenBarrierError
