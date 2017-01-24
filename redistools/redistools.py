@@ -42,7 +42,9 @@ _logger.setLevel(logging.INFO)
 class RedisTools(_ABC):
     def destroy(self):
         """force destroy all data in redis database."""
-        pass
+        clear = getattr(self, "clear", None)
+        if clear:
+            clear()
 
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
@@ -497,6 +499,8 @@ class RedisCondition(RedisTools):
     def destroy(self):
         if self._is_new_lock:
             self._lock.destroy()
+        for waiter_key in self._waiters:
+            RedisLock(redis=_StrictRedis, key=waiter_key).destroy()
         self._waiters.destroy()
 
     def __enter__(self):
