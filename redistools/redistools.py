@@ -43,6 +43,12 @@ class RedisTools(_ABC):
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
 
+    def _clone_same_redis(self):
+        connection_kwargs = self._redis.connection_pool.connection_kwargs
+        connection_pool = _ConnectionPool(**connection_kwargs)
+        new_redis = _StrictRedis(connection_pool=connection_pool)
+        self._redis = new_redis
+
     def __repr__(self):
         cls_name = self.__class__.__name__
         _repr_data = getattr(self, "_repr_data", None)
@@ -55,6 +61,39 @@ class RedisTools(_ABC):
             return '<%s at "%s" with %s>' % (cls_name, key, data)
         else:
             return '<%s at "%s">' % (cls_name, key)
+
+    def _backup_redis(self, state):
+        if "_redis" in state:
+            redis = state.pop("_redis")
+            state["redis_name"] = "_redis"
+        elif "redis" in state:
+            redis = state.pop("redis")
+            state["redis_name"] = "redis"
+        else:
+            state["redis_name"] = None
+            return state
+        connection_kwargs = redis.connection_pool.connection_kwargs
+        state["connection_kwargs"] = connection_kwargs
+        return state
+
+    def _restore_redis(self, state):
+        redis_name = state.pop("redis_name")
+        if redis_name:
+            connection_kwargs = state.pop("connection_kwargs")
+            connection_pool = _ConnectionPool(**connection_kwargs)
+            redis = _StrictRedis(connection_pool=connection_pool)
+            self.__dict__[redis_name] = redis
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = self.__dict__.copy()
+        state.update(self._backup_redis(state))
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__dict__.update(state)
 
 
 class RedisDict(RedisTools, redis_collections.Dict):
@@ -118,16 +157,30 @@ class RedisNamespace(RedisTools):
             pass
         raise AttributeError(item)
 
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = dict()
+        state["key"] = super(RedisNamespace, self).__getattribute__("key")
+        state["_local_dict"] = super(RedisNamespace, self).__getattribute__("_local_dict")
+        connection_kwargs = super(RedisNamespace, self).__getattribute__("_redis").connection_pool.connection_kwargs
+        state["connection_kwargs"] = connection_kwargs
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        connection_kwargs = state.pop("connection_kwargs")
+        connection_pool = _ConnectionPool(**connection_kwargs)
+        redis = _StrictRedis(connection_pool=connection_pool)
+        key = state["key"]
+        _local_dict = state["_local_dict"]
+        super(RedisNamespace, self).__setattr__("key", key)
+        super(RedisNamespace, self).__setattr__("_redis", redis)
+        super(RedisNamespace, self).__setattr__("_redis_dict", RedisDict(redis=redis, key=key))
+        super(RedisNamespace, self).__setattr__("_local_dict", _local_dict)
+
 
 class InvalidOperator(RuntimeError):
     pass
-
-
-def _clone_same_redis(redis):
-    connection_kwargs = redis.connection_pool.connection_kwargs
-    connection_pool = _ConnectionPool(**connection_kwargs)
-    new_redis = _StrictRedis(connection_pool=connection_pool)
-    return new_redis
 
 
 class RedisLock(RedisTools):
@@ -145,7 +198,8 @@ class RedisLock(RedisTools):
             key = self._create_key()
         self.key = key
         if redis:
-            self._redis = _clone_same_redis(redis)
+            self._redis = redis
+            self._clone_same_redis()
         else:
             self._redis = _StrictRedis()
         self._expire = expire if expire is None else RedisLock.to_int(expire)
