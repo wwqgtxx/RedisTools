@@ -40,6 +40,10 @@ _logger.setLevel(logging.INFO)
 
 
 class RedisTools(_ABC):
+    def destroy(self):
+        """force destroy all data in redis database."""
+        pass
+
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
 
@@ -122,10 +126,12 @@ class RedisNamespace(RedisTools):
             key = super(RedisNamespace, self)._create_key()
         if not redis:
             redis = _StrictRedis()
+        redis_dict = RedisDict(redis=redis, key=key)
         super(RedisNamespace, self).__setattr__("key", key)
         super(RedisNamespace, self).__setattr__("_redis", redis)
-        super(RedisNamespace, self).__setattr__("_redis_dict", RedisDict(redis=redis, key=key))
+        super(RedisNamespace, self).__setattr__("_redis_dict", redis_dict)
         super(RedisNamespace, self).__setattr__("_local_dict", dict())
+        super(RedisNamespace, self).__setattr__("destroy", redis_dict.destroy)
 
     def __getattribute__(self, item):
         try:
@@ -173,10 +179,12 @@ class RedisNamespace(RedisTools):
         redis = _StrictRedis(connection_pool=connection_pool)
         key = state["key"]
         _local_dict = state["_local_dict"]
+        redis_dict = RedisDict(redis=redis, key=key)
         super(RedisNamespace, self).__setattr__("key", key)
         super(RedisNamespace, self).__setattr__("_redis", redis)
-        super(RedisNamespace, self).__setattr__("_redis_dict", RedisDict(redis=redis, key=key))
+        super(RedisNamespace, self).__setattr__("_redis_dict", redis_dict)
         super(RedisNamespace, self).__setattr__("_local_dict", _local_dict)
+        super(RedisNamespace, self).__setattr__("destroy", redis_dict.destroy)
 
 
 class InvalidOperator(RuntimeError):
@@ -278,6 +286,9 @@ class RedisLock(RedisTools):
         if need_delete_all:
             self._delete_all()
 
+    def destroy(self):
+        self.reset()
+
     def _delete_all(self):
         pipe = self._redis.pipeline()
         with pipe:
@@ -333,6 +344,9 @@ class RedisRLock(RedisTools):
         self._block = RedisLock(redis=redis, key=self._block_key, expire=expire)
         self._owner = None
         self._count = 0
+
+    def destroy(self):
+        self._block.destroy()
 
     def __repr__(self):
         owner = self._owner
@@ -454,8 +468,10 @@ class RedisCondition(RedisTools):
             _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
             lock = RedisRLock(redis=self._redis, key=self._lock_key)
+            self._is_new_lock = True
         else:
             self._lock_key = lock.key
+            self._is_new_lock = False
         self._lock = lock
         # Export the lock's acquire() and release() methods
         self.acquire = lock.acquire
@@ -477,6 +493,11 @@ class RedisCondition(RedisTools):
             pass
         self._waiters_key = self.key + ":RedisDeque:_waiters"
         self._waiters = RedisDeque(redis=self._redis, key=self._waiters_key)
+
+    def destroy(self):
+        if self._is_new_lock:
+            self._lock.destroy()
+        self._waiters.destroy()
 
     def __enter__(self):
         return self._lock.__enter__()
@@ -649,6 +670,11 @@ class RedisSemaphore(RedisTools):
         self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
         self._class_dict["_value"] = self._class_dict.get("_value", value)
 
+    def destroy(self):
+        self._class_dict.destroy()
+        self._lock.destroy()
+        self._cond.destroy()
+
     def acquire(self, blocking=True, timeout=None):
         """Acquire a semaphore, decrementing the internal counter by one.
 
@@ -755,7 +781,7 @@ class RedisEvent(RedisTools):
     """Class implementing event objects.
 
     Events manage a flag that can be set to true with the set() method and reset
-    to false with the clear() method. The wait() method blocks until the flag is
+    to false with the destroy() method. The wait() method blocks until the flag is
     true.  The flag is initially false.
 
     """
@@ -774,6 +800,11 @@ class RedisEvent(RedisTools):
         self._lock = RedisLock(redis=self._redis, key=self._lock_key)
         self._cond = RedisCondition(lock=self._lock, redis=self._redis, key=self._cond_key)
         self._class_dict["_flag"] = self._class_dict.get("_flag", False)
+
+    def destroy(self):
+        self._class_dict.destroy()
+        self._lock.destroy()
+        self._cond.destroy()
 
     def _reset_internal_locks(self):
         # private!  called by Thread._reset_internal_locks by _after_fork()
@@ -864,6 +895,11 @@ class RedisBarrier(RedisTools):
         self._class_dict["_state"] = self._class_dict.get("_state",
                                                           0)  # 0 filling, 1, draining, -1 resetting, -2 broken
         self._class_dict["_count"] = self._class_dict.get("_count", 0)
+
+    def destroy(self):
+        self._class_dict.destroy()
+        self._lock.destroy()
+        self._cond.destroy()
 
     def wait(self, timeout=None):
         """Wait for the barrier.
@@ -1052,6 +1088,13 @@ class RedisQueue(RedisTools):
         self.all_tasks_done = RedisCondition(lock=self.mutex, redis=self._redis, key=self.all_tasks_done_key)
         # self.unfinished_tasks = 0
         self._class_dict["unfinished_tasks"] = 0
+
+    def destroy(self):
+        self.queue.destroy()
+        self._class_dict.destroy()
+        self.not_empty.destroy()
+        self.not_full.destroy()
+        self.mutex.destroy()
 
     def task_done(self):
         '''Indicate that a formerly enqueued task is complete.
