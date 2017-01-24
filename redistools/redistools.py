@@ -1308,6 +1308,67 @@ class LifoRedisQueue(RedisQueue):
         return self.queue.pop()
 
 
+class RedisPipe(RedisTools):
+    A = "A"
+    B = "B"
+    INPUT = "INPUT"
+    OUTPUT = "OUTPUT"
+
+    def __init__(self, maxsize=0, redis=None, key=None, channel=A):
+        self._redis = redis or _StrictRedis()
+        if not key:
+            key = self._create_key()
+        self.key = key
+        self.queue_A_key = self.key + ":RedisQueue:queue_A"
+        self.queue_B_key = self.key + ":RedisQueue:queue_B"
+        self.queue_A = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_A_key)
+        self.queue_B = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_B_key)
+        self.set_channel(channel)
+
+    def set_channel(self, channel=A):
+        if channel == RedisPipe.A:
+            self.input_queue = self.queue_A
+            self.output_queue = self.queue_B
+        elif channel == RedisPipe.B:
+            self.input_queue = self.queue_B
+            self.output_queue = self.queue_A
+        else:
+            raise ValueError(channel)
+        self.channel = channel
+
+    def destroy(self):
+        self.queue_A.destroy()
+        self.queue_B.destroy()
+
+    def empty(self, channel):
+        if channel == RedisPipe.INPUT:
+            return self.input_queue.empty()
+        elif channel == RedisPipe.OUTPUT:
+            return self.output_queue.empty()
+        else:
+            raise ValueError(channel)
+
+    def full(self, channel):
+        if channel == RedisPipe.INPUT:
+            return self.input_queue.full()
+        elif channel == RedisPipe.OUTPUT:
+            return self.output_queue.full()
+        else:
+            raise ValueError(channel)
+
+    def put(self, item, block=True, timeout=None):
+        return self.input_queue.put(item, block, timeout)
+
+    def get(self, block=True, timeout=None):
+        return self.output_queue.get(block, timeout)
+
+    def put_nowait(self, item):
+        return self.put(item, block=False)
+
+    def get_nowait(self):
+        return self.get(block=False)
+
+
 def open_debug():
     import sys
     logging.basicConfig(level=logging.DEBUG,

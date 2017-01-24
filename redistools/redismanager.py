@@ -87,3 +87,8 @@ class RedisManager(object):
         result = RedisQueue(maxsize=maxsize, redis=self._redis)
         logger.info("create new RedisQueue with key<%s>" % str(result.key))
         return result
+
+    def Pipe(self, maxsize=0):
+        result = RedisPipe(maxsize=maxsize, redis=self._redis)
+        logger.info("create new RedisPipe with key<%s>" % str(result.key))
+        return result
