@@ -43,6 +43,19 @@ class RedisTools(_ABC):
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
 
+    def __repr__(self):
+        cls_name = self.__class__.__name__
+        _repr_data = getattr(self, "_repr_data", None)
+        if _repr_data:
+            data = _repr_data()
+        else:
+            data = ''
+        key = getattr(self, "key", "UnKnown")
+        if data:
+            return '<%s at "%s" with %s>' % (cls_name, key, data)
+        else:
+            return '<%s at "%s">' % (cls_name, key)
+
 
 class RedisDict(RedisTools, redis_collections.Dict):
     pass
@@ -62,6 +75,48 @@ class RedisCounter(RedisTools, redis_collections.Counter):
 
 class RedisDefaultDict(RedisTools, redis_collections.DefaultDict):
     pass
+
+
+class RedisNamespace(RedisTools):
+    def __init__(self, redis=None, key=None):
+        if not key:
+            key = super(RedisNamespace, self)._create_key()
+        if not redis:
+            redis = _StrictRedis()
+        super(RedisNamespace, self).__setattr__("key", key)
+        super(RedisNamespace, self).__setattr__("_redis", redis)
+        super(RedisNamespace, self).__setattr__("_redis_dict", RedisDict(redis=redis, key=key))
+        super(RedisNamespace, self).__setattr__("_local_dict", dict())
+
+    def __getattribute__(self, item):
+        try:
+            if str(item).startswith('_'):
+                return super(RedisNamespace, self).__getattribute__("_local_dict")[item]
+            else:
+                return super(RedisNamespace, self).__getattribute__("_redis_dict")[item]
+        except AttributeError:
+            pass
+        except KeyError:
+            pass
+        return super(RedisNamespace, self).__getattribute__(item)
+
+    def __setattr__(self, key, value):
+        if key == "key":
+            raise UserWarning('Can not change the key!')
+        if str(key).startswith('_'):
+            super(RedisNamespace, self).__getattribute__("_local_dict")[key] = value
+        else:
+            super(RedisNamespace, self).__getattribute__("_redis_dict")[key] = value
+
+    def __delattr__(self, item):
+        try:
+            if str(item).startswith('_'):
+                del super(RedisNamespace, self).__getattribute__("_local_dict")[item]
+            else:
+                del super(RedisNamespace, self).__getattribute__("_redis_dict")[item]
+        except KeyError:
+            pass
+        raise AttributeError(item)
 
 
 class InvalidOperator(RuntimeError):
@@ -918,6 +973,11 @@ class RedisQueue(RedisTools):
         self.maxsize = self._class_dict.get("maxsize", maxsize)
         self._class_dict["maxsize"] = self.maxsize
         self._init(maxsize)
+
+        try:
+            self._repr_data = self.queue._repr_data
+        except AttributeError:
+            pass
 
         # mutex must be held whenever the queue is mutating.  All methods
         # that acquire mutex must release it before returning.  mutex

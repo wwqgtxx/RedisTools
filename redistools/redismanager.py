@@ -43,6 +43,11 @@ class RedisManager(object):
         logger.info("create new RedisList with key<%s>" % str(result.key))
         return result
 
+    def Namespace(self):
+        result = RedisNamespace(redis=self._redis)
+        logger.info("create new RedisNamespace with key<%s>" % str(result.key))
+        return result
+
     def Lock(self):
         result = RedisLock(redis=self._redis)
         logger.info("create new RedisLock with key<%s>" % str(result.key))
