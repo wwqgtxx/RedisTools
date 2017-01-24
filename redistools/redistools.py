@@ -88,12 +88,12 @@ class RedisTools(_ABC):
             connection_kwargs = state.pop("connection_kwargs")
             connection_pool = _ConnectionPool(**connection_kwargs)
             redis = _StrictRedis(connection_pool=connection_pool)
-            self.__dict__[redis_name] = redis
+            state[redis_name] = redis
 
     def __getstate__(self):
         """Return state values to be pickled."""
         state = self.__dict__.copy()
-        state.update(self._backup_redis(state))
+        self._backup_redis(state)
         return state
 
     def __setstate__(self, state):
@@ -217,6 +217,23 @@ class RedisLock(RedisTools):
         self._signal = key + ":_signal"
         self._owner = None
         self.care_operator = care_operator
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key,
+            "expire": self._expire,
+            "care_operator": self.care_operator,
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"], expire=state["expire"],
+                      care_operator=state["care_operator"])
 
     @staticmethod
     def to_int(num):
@@ -350,6 +367,21 @@ class RedisRLock(RedisTools):
     def destroy(self):
         self._block.destroy()
 
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._block._redis,
+            "key": self.key,
+            "expire": self._block._expire
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"], expire=state["expire"])
+
     def __repr__(self):
         owner = self._owner
         return "<%s %s.%s object owner=%s count=%d at %s>" % (
@@ -467,7 +499,8 @@ class RedisCondition(RedisTools):
         self.key = key
         self._redis = redis or _StrictRedis()
         if not isinstance(lock, RedisLock) and not isinstance(lock, RedisRLock):
-            _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
+            if lock:
+                _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
             self._lock_key = self.key + ":RedisRLock:_lock"
             lock = RedisRLock(redis=self._redis, key=self._lock_key)
             self._is_new_lock = True
@@ -502,6 +535,21 @@ class RedisCondition(RedisTools):
         for waiter_key in self._waiters:
             RedisLock(redis=_StrictRedis, key=waiter_key).destroy()
         self._waiters.destroy()
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key,
+            "_lock": self._lock
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(lock=state["_lock"], redis=state["_redis"], key=state["key"])
 
     def __enter__(self):
         return self._lock.__enter__()
@@ -679,6 +727,20 @@ class RedisSemaphore(RedisTools):
         self._lock.destroy()
         self._cond.destroy()
 
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"])
+
     def acquire(self, blocking=True, timeout=None):
         """Acquire a semaphore, decrementing the internal counter by one.
 
@@ -810,6 +872,20 @@ class RedisEvent(RedisTools):
         self._lock.destroy()
         self._cond.destroy()
 
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"])
+
     def _reset_internal_locks(self):
         # private!  called by Thread._reset_internal_locks by _after_fork()
         self._lock = RedisLock(redis=self._redis, key=self._lock_key)
@@ -904,6 +980,21 @@ class RedisBarrier(RedisTools):
         self._class_dict.destroy()
         self._lock.destroy()
         self._cond.destroy()
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key,
+            "parties": self.parties
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(parties=state["parties"], redis=state["_redis"], key=state["key"])
 
     def wait(self, timeout=None):
         """Wait for the barrier.
@@ -1099,6 +1190,20 @@ class RedisQueue(RedisTools):
         self.not_empty.destroy()
         self.not_full.destroy()
         self.mutex.destroy()
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key,
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"])
 
     def task_done(self):
         '''Indicate that a formerly enqueued task is complete.
@@ -1339,6 +1444,21 @@ class RedisPipe(RedisTools):
     def destroy(self):
         self.queue_A.destroy()
         self.queue_B.destroy()
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        state = {
+            "_redis": self._redis,
+            "key": self.key,
+            "channel": self.channel
+        }
+        self._backup_redis(state)
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from the unpickled state values."""
+        self._restore_redis(state)
+        self.__init__(redis=state["_redis"], key=state["key"], channel=state["channel"])
 
     def empty(self, channel):
         if channel == RedisPipe.INPUT:
