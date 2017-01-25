@@ -38,6 +38,8 @@ import logging
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
 
+_default_redis = _StrictRedis()
+
 
 class RedisTools(_ABC):
     def destroy(self):
@@ -79,6 +81,8 @@ class RedisTools(_ABC):
             state["redis_name"] = None
             return state
         connection_kwargs = redis.connection_pool.connection_kwargs
+        if connection_kwargs == _default_redis.connection_pool.connection_kwargs:
+            connection_kwargs = None
         state["connection_kwargs"] = connection_kwargs
         return state
 
@@ -86,8 +90,11 @@ class RedisTools(_ABC):
         redis_name = state.pop("redis_name")
         if redis_name:
             connection_kwargs = state.pop("connection_kwargs")
-            connection_pool = _ConnectionPool(**connection_kwargs)
-            redis = _StrictRedis(connection_pool=connection_pool)
+            if connection_kwargs:
+                connection_pool = _ConnectionPool(**connection_kwargs)
+                redis = _StrictRedis(connection_pool=connection_pool)
+            else:
+                redis = _default_redis
             state[redis_name] = redis
 
     def __getstate__(self):
@@ -127,7 +134,7 @@ class RedisNamespace(RedisTools):
         if not key:
             key = super(RedisNamespace, self)._create_key()
         if not redis:
-            redis = _StrictRedis()
+            redis = _default_redis
         redis_dict = RedisDict(redis=redis, key=key)
         super(RedisNamespace, self).__setattr__("key", key)
         super(RedisNamespace, self).__setattr__("_redis", redis)
@@ -497,7 +504,7 @@ class RedisCondition(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not isinstance(lock, RedisLock) and not isinstance(lock, RedisRLock):
             if lock:
                 _logger.warning("the lock is not a RedisLock or RedisRLock,try to new a RedisRLock")
@@ -710,7 +717,7 @@ class RedisSemaphore(RedisTools):
     def __init__(self, value=1, redis=None, key=None):
         if value < 0:
             raise ValueError("semaphore initial value must be >= 0")
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not key:
             key = self._create_key()
         self.key = key
@@ -855,7 +862,7 @@ class RedisEvent(RedisTools):
     # After Tim Peters' event class (without is_posted())
 
     def __init__(self, redis=None, key=None):
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not key:
             key = self._create_key()
         self.key = key
@@ -959,7 +966,7 @@ class RedisBarrier(RedisTools):
         default for all subsequent 'wait()' calls.
 
         """
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not key:
             key = self._create_key()
         self.key = key
@@ -1144,7 +1151,7 @@ class RedisQueue(RedisTools):
     '''
 
     def __init__(self, maxsize=0, redis=None, key=None):
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not key:
             key = self._create_key()
         self.key = key
@@ -1420,23 +1427,33 @@ class RedisPipe(RedisTools):
     OUTPUT = "OUTPUT"
 
     def __init__(self, maxsize=0, redis=None, key=None, channel=A):
-        self._redis = redis or _StrictRedis()
+        self._redis = redis or _default_redis
         if not key:
             key = self._create_key()
         self.key = key
+        self.lock_A_key = self.key + ":RedisLock:lock_A"
+        self.lock_B_key = self.key + ":RedisLock:lock_B"
         self.queue_A_key = self.key + ":RedisQueue:queue_A"
         self.queue_B_key = self.key + ":RedisQueue:queue_B"
+        self.lock_A = RedisLock(redis=self._redis, key=self.lock_A_key)
+        self.lock_B = RedisLock(redis=self._redis, key=self.lock_B_key)
         self.queue_A = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_A_key)
         self.queue_B = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_B_key)
+        self.input_queue = None  # type: RedisQueue
+        self.output_queue = None  # type: RedisQueue
+        self.lock = None  # type: RedisLock
+        self.channel = None
         self.set_channel(channel)
 
     def set_channel(self, channel=A):
         if channel == RedisPipe.A:
             self.input_queue = self.queue_A
             self.output_queue = self.queue_B
+            self.lock = self.lock_A
         elif channel == RedisPipe.B:
             self.input_queue = self.queue_B
             self.output_queue = self.queue_A
+            self.lock = self.lock_B
         else:
             raise ValueError(channel)
         self.channel = channel
@@ -1444,6 +1461,8 @@ class RedisPipe(RedisTools):
     def destroy(self):
         self.queue_A.destroy()
         self.queue_B.destroy()
+        self.lock_A.destroy()
+        self.lock_B.destroy()
 
     def __getstate__(self):
         """Return state values to be pickled."""
@@ -1459,6 +1478,18 @@ class RedisPipe(RedisTools):
         """Restore state from the unpickled state values."""
         self._restore_redis(state)
         self.__init__(redis=state["_redis"], key=state["key"], channel=state["channel"])
+
+    def acquire(self, blocking=True, timeout=None):
+        return self.lock.acquire(blocking, timeout)
+
+    def __enter__(self):
+        return self.lock.__enter__()
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        return self.lock.__exit__(exc_type, exc_value, traceback)
+
+    def release(self):
+        return self.lock.release()
 
     def empty(self, channel):
         if channel == RedisPipe.INPUT:
