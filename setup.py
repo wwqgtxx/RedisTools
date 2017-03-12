@@ -29,7 +29,6 @@ setup(
     packages=["redistools"],
     platforms='any',
     install_requires=[
-        'future>=0.16.0',
         'redis>=2.10.5',
         'six>=1.10.0',
         'monotonic>=1.2',

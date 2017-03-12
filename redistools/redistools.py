@@ -3,27 +3,25 @@
 # author wwqgtxx <wwqgtxx@gmail.com>
 from __future__ import (absolute_import, division,
                         print_function, unicode_literals)
-from future import standard_library
-
-standard_library.install_aliases()
-from builtins import *
 import os
 import uuid
-import queue
 import threading
+import pickle
+import abc
+import six
 from itertools import islice as _islice, count as _count
 from monotonic import monotonic as _time
 from heapq import heappush as _heappush, heappop as _heappop
 
 try:
-    from abc import ABC as _ABC
-except ImportError:
-    _ABC = object
-
-try:
     from _collections import deque as _deque
 except ImportError:
     from collections import deque as _deque
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
 
 try:
     from threading import get_ident as _theading_get_ident
@@ -40,8 +38,18 @@ _logger.setLevel(logging.INFO)
 
 _default_redis = _StrictRedis()
 
+__all__ = ["RedisTools",
+           "RedisDict", "RedisList", "RedisDeque", "RedisCounter", "RedisDefaultDict", "RedisNamespace",
+           "RedisLock", "RedisRLock", "RedisCondition", "RedisSemaphore", "RedisBoundedSemaphore",
+           "RedisEvent", "RedisBarrier", "RedisQueue", "PriorityRedisQueue", "LifoRedisQueue", "RedisPipe",
+           "Empty", "Full",
+           "BrokenBarrierError", "InvalidOperator",
+           "get_unique_thread_id_str"
+           ]
 
-class RedisTools(_ABC):
+
+@six.add_metaclass(abc.ABCMeta)
+class RedisTools(object):
     def destroy(self):
         """force destroy all data in redis database."""
         clear = getattr(self, "clear", None)
@@ -50,6 +58,33 @@ class RedisTools(_ABC):
 
     def _create_key(self):
         return "%s:AutoUUID:%s" % (self.__class__.__name__, uuid.uuid4().hex)
+
+    def _pickle(self, data):
+        """Converts given data to a bytes string.
+
+        :param data: Data to be serialized.
+        :type data: anything serializable
+        :rtype: bytes
+        """
+        if six.PY34:
+            return pickle.dumps(data, protocol=4)
+        else:
+            return pickle.dumps(data)
+
+    def _pickle_3(self, data):
+        # Several numeric types are equal, have the same hash, but nonetheless
+        # pickle to different byte strings. This method reduces them down to
+        # integers to help match with Python's behavior.
+        # len({1.0, 1, complex(1, 0)}) == 1
+        if isinstance(data, complex):
+            int_data = int(data.real)
+            if data == int_data:
+                data = int_data
+        elif isinstance(data, redis_collections.base.NUMERIC_TYPES):
+            int_data = int(data)
+            if data == int_data:
+                data = int_data
+        return self._pickle(data)
 
     def _clone_same_redis(self):
         connection_kwargs = self._redis.connection_pool.connection_kwargs
@@ -110,7 +145,9 @@ class RedisTools(_ABC):
 
 
 class RedisDict(RedisTools, redis_collections.Dict):
-    pass
+    if six.PY34:
+        _pickle_key = RedisTools._pickle_3
+        _pickle_value = RedisTools._pickle_3
 
 
 class RedisList(RedisTools, redis_collections.List):
@@ -171,6 +208,24 @@ class RedisNamespace(RedisTools):
         except KeyError:
             pass
         raise AttributeError(item)
+
+    def __getitem__(self, item):
+        if str(item).startswith('_'):
+            return super(RedisNamespace, self).__getattribute__("_local_dict")[item]
+        else:
+            return super(RedisNamespace, self).__getattribute__("_redis_dict")[item]
+
+    def __setitem__(self, key, value):
+        if str(key).startswith('_'):
+            super(RedisNamespace, self).__getattribute__("_local_dict")[key] = value
+        else:
+            super(RedisNamespace, self).__getattribute__("_redis_dict")[key] = value
+
+    def __delitem__(self, key):
+        if str(key).startswith('_'):
+            del super(RedisNamespace, self).__getattribute__("_local_dict")[key]
+        else:
+            del super(RedisNamespace, self).__getattribute__("_redis_dict")[key]
 
     def __getstate__(self):
         """Return state values to be pickled."""
@@ -252,7 +307,7 @@ class RedisLock(RedisTools):
         return num
 
     def acquire(self, blocking=True, timeout=None):
-        if self.care_operator and self._owner == _get_ident():
+        if self.care_operator and self._owner == get_unique_thread_id_str():
             raise InvalidOperator("Already acquired lock by this process and this thread")
         timeout = timeout if timeout is None else RedisLock.to_int(timeout)
         if timeout is not None and timeout <= 0:
@@ -278,7 +333,7 @@ class RedisLock(RedisTools):
                 break
 
         _logger.debug("Got lock for %r.", self.key)
-        self._owner = _get_ident()
+        self._owner = get_unique_thread_id_str()
         return True
 
     def __enter__(self):
@@ -290,7 +345,7 @@ class RedisLock(RedisTools):
         self.release()
 
     def release(self):
-        if (not self.care_operator) or self._owner == _get_ident():
+        if (not self.care_operator) or self._owner == get_unique_thread_id_str():
             _logger.debug("Releasing %r.", self.key)
             self.reset(need_delete_all=False)
         else:
@@ -333,7 +388,7 @@ class RedisLock(RedisTools):
 
     def _is_owned(self):
         # Return True if lock is owned by current_thread.
-        return self._owner == _get_ident()
+        return self._owner == get_unique_thread_id_str()
 
     def locked(self):
         if self._is_owned():
@@ -345,8 +400,9 @@ class RedisLock(RedisTools):
             return True
 
 
-def _get_ident():
-    result = "<pid:%s,thread_id:%s>" % (str(os.getpid()), str(_theading_get_ident()))
+def get_unique_thread_id_str():
+    result = "<node:%s,pid:%s,thread_id:%s,thread_hash:%s>" % (
+        str(uuid.getnode()), str(os.getpid()), str(_theading_get_ident()), str(hash(threading.current_thread())))
     # _logger.debug(result)
     return result
 
@@ -426,7 +482,7 @@ class RedisRLock(RedisTools):
         been acquired, false if the timeout has elapsed.
 
         """
-        me = _get_ident()
+        me = get_unique_thread_id_str()
         if self._owner == me:
             self._count += 1
             return self._count
@@ -454,7 +510,7 @@ class RedisRLock(RedisTools):
         There is no return value.
 
         """
-        if self._owner != _get_ident() and self._count == 0:
+        if self._owner != get_unique_thread_id_str() and self._count == 0:
             raise InvalidOperator("cannot release lock by other thread or process")
         self._count -= 1
         if self._count == 0:
@@ -482,8 +538,8 @@ class RedisRLock(RedisTools):
         return (count, owner)
 
     def _is_owned(self):
-        # _logger.debug([self._owner, _get_ident(),self._owner == _get_ident()])
-        # return self._owner == _get_ident()
+        # _logger.debug([self._owner, get_unique_thread_id_str(),self._owner == get_unique_thread_id_str()])
+        # return self._owner == get_unique_thread_id_str()
         return self._block._is_owned()
 
 
@@ -1155,7 +1211,7 @@ class RedisQueue(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self.mutex_key = self.key + ":RedisLock:mutex_key"
+        self.mutex_key = self.key + ":RedisLock:mutex"
         self.not_empty_key = self.key + ":RedisCondition:not_empty"
         self.not_full_key = self.key + ":RedisCondition:not_full"
         self.all_tasks_done_key = self.key + ":RedisCondition:all_tasks_done"
@@ -1366,7 +1422,7 @@ class RedisQueue(RedisTools):
 
     # Initialize the queue representation
     def _init(self, maxsize):
-        self.queue_key = self.key + ":RedisDeque:queue_key"
+        self.queue_key = self.key + ":RedisDeque:queue"
         self.queue = RedisDeque(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
@@ -1389,7 +1445,7 @@ class PriorityRedisQueue(RedisQueue):
     '''
 
     def _init(self, maxsize):
-        self.queue_key = self.key + ":RedisList:queue_key"
+        self.queue_key = self.key + ":RedisList:queue"
         self.queue = RedisList(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
@@ -1407,7 +1463,7 @@ class LifoRedisQueue(RedisQueue):
     '''Variant of Queue that retrieves most recently added entries first.'''
 
     def _init(self, maxsize):
-        self.queue_key = self.key + ":RedisList:queue_key"
+        self.queue_key = self.key + ":RedisList:queue"
         self.queue = RedisList(redis=self._redis, key=self.queue_key)
 
     def _qsize(self):
@@ -1431,12 +1487,12 @@ class RedisPipe(RedisTools):
         if not key:
             key = self._create_key()
         self.key = key
-        self.lock_A_key = self.key + ":RedisLock:lock_A"
-        self.lock_B_key = self.key + ":RedisLock:lock_B"
+        self.lock_A_key = self.key + ":RedisRLock:lock_A"
+        self.lock_B_key = self.key + ":RedisRLock:lock_B"
         self.queue_A_key = self.key + ":RedisQueue:queue_A"
         self.queue_B_key = self.key + ":RedisQueue:queue_B"
-        self.lock_A = RedisLock(redis=self._redis, key=self.lock_A_key)
-        self.lock_B = RedisLock(redis=self._redis, key=self.lock_B_key)
+        self.lock_A = RedisRLock(redis=self._redis, key=self.lock_A_key)
+        self.lock_B = RedisRLock(redis=self._redis, key=self.lock_B_key)
         self.queue_A = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_A_key)
         self.queue_B = RedisQueue(maxsize=maxsize, redis=self._redis, key=self.queue_B_key)
         self.input_queue = None  # type: RedisQueue
@@ -1457,6 +1513,9 @@ class RedisPipe(RedisTools):
         else:
             raise ValueError(channel)
         self.channel = channel
+
+    def clone(self):
+        return RedisPipe(redis=self._redis, key=self.key, channel=self.channel)
 
     def destroy(self):
         self.queue_A.destroy()
